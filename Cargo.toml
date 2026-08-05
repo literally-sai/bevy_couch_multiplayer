@@ -1,0 +1,24 @@
+[package]
+name = "bevy_couch_multiplayer"
+version = "0.1.0"
+edition = "2024"
+description = "Local co-op gamepad management for Bevy: stable player slots, join/leave flows, disconnect recovery, and mixed haptics."
+license = "MIT"
+repository = "https://github.com/you/bevy_couch_multiplayer"
+keywords = ["bevy", "gamepad", "multiplayer", "local-coop", "rumble"]
+categories = ["game-development"]
+
+[dependencies]
+bevy_app = "0.19"
+bevy_ecs = "0.19"
+bevy_input = { version = "0.19", features = ["gamepad"] }
+bevy_math = "0.19"
+bevy_time = "0.19"
+log = "0.4"
+
+[dev-dependencies]
+bevy = "0.19"
+
+[[example]]
+name = "couch"
+path = "examples/couch.rs"
