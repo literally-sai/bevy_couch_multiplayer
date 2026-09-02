@@ -1,6 +1,6 @@
 [package]
 name = "bevy_couch_multiplayer"
-version = "0.1.1"
+version = "0.2.1"
 edition = "2024"
 description = "Local co-op gamepad management for Bevy: stable player slots, join/leave flows, disconnect recovery, and mixed haptics."
 license = "MIT"

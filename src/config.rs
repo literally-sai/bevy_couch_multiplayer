@@ -8,7 +8,7 @@ pub enum JoinMode {
     ///
     /// Good for games that start straight into gameplay.
     Automatic,
-    /// A gamepad joins when the given button is pressed on it.
+    /// A gamepad joins when the given trigger fires on it.
     ///
     /// This is what most couch co-op games want: a controller can be plugged
     /// in and sit idle until its owner actually presses something.
@@ -27,11 +27,14 @@ impl Default for JoinMode {
 /// Which button press counts as "I want in".
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JoinTrigger {
-    /// Any face/shoulder/d-pad button. Triggers are excluded, since resting
-    /// triggers on some pads report spurious presses.
+    /// Any face/shoulder/d-pad button — see [`JOIN_BUTTONS`](crate::JOIN_BUTTONS).
+    /// Triggers are excluded, since resting triggers on worn pads report
+    /// spurious presses.
     AnyButton,
     /// One specific button.
     Button(GamepadButton),
+    /// Any of several buttons, for "press Start or A to join" prompts.
+    AnyOf(Vec<GamepadButton>),
 }
 
 impl Default for JoinTrigger {
@@ -47,8 +50,15 @@ pub enum LeaveMode {
     /// [`PlayerRoster::request_leave`](crate::PlayerRoster::request_leave).
     Manual,
     /// Hold a button for `secs` to drop out. A hold (rather than a tap) avoids
-    /// someone rage-quitting the party by fat-fingering Select.
-    HoldButton { button: GamepadButton, secs: f32 },
+    /// someone rage-quitting the party by fat-fingering Select. Wire
+    /// [`LeaveHold::progress`](crate::LeaveHold::progress) to a filling ring so
+    /// the hold is visible.
+    HoldButton {
+        /// Button to hold.
+        button: GamepadButton,
+        /// How long it must be held. Clamped to at least 0.
+        secs: f32,
+    },
 }
 
 impl Default for LeaveMode {
@@ -82,6 +92,24 @@ pub struct ReconnectPolicy {
     pub adopt_any: bool,
 }
 
+impl ReconnectPolicy {
+    /// Hold slots forever, restore by matching hardware, allow borrowed pads.
+    /// Same as [`Default`], spelled out for readability at a call site.
+    pub fn forgiving() -> Self {
+        Self::default()
+    }
+
+    /// Drop a player `secs` after their controller goes away, and only ever
+    /// restore them on their original hardware.
+    pub fn strict(secs: f32) -> Self {
+        Self {
+            grace_secs: Some(secs.max(0.0)),
+            match_device: true,
+            adopt_any: false,
+        }
+    }
+}
+
 impl Default for ReconnectPolicy {
     fn default() -> Self {
         Self {
@@ -92,11 +120,27 @@ impl Default for ReconnectPolicy {
     }
 }
 
-/// Plugin-wide settings. Inserted as a resource; mutate it at runtime to
-/// change behaviour (e.g. flip `rumble_enabled` from an options menu).
-#[derive(Resource, Debug, Clone)]
+/// Plugin-wide settings, inserted as a resource.
+///
+/// Every field can be changed at runtime — an options menu can flip
+/// [`rumble_enabled`](Self::rumble_enabled), drag
+/// [`rumble_scale`](Self::rumble_scale), or grow
+/// [`max_players`](Self::max_players) mid-session and the plugin will follow.
+///
+/// ```
+/// use bevy::prelude::*;
+/// use bevy_couch_multiplayer::prelude::*;
+///
+/// fn accessibility_menu(mut config: ResMut<CouchConfig>) {
+///     config.rumble_scale = 0.5;
+/// }
+/// ```
+#[derive(Resource, Debug, Clone, PartialEq)]
 pub struct CouchConfig {
     /// Number of slots. Slots are stable: player 2 stays player 2.
+    ///
+    /// Raising this at runtime opens new slots immediately. Lowering it only
+    /// removes empty trailing slots — nobody is kicked mid-game.
     pub max_players: u8,
     /// How an unassigned gamepad becomes a player.
     pub join_mode: JoinMode,
@@ -136,27 +180,74 @@ impl Default for CouchConfig {
 }
 
 impl CouchConfig {
-    /// Set the slot count. Clamped to at least 1.
+    /// Slot count, clamped to at least 1.
     pub fn with_max_players(mut self, max: u8) -> Self {
         self.max_players = max.max(1);
         self
     }
 
-    /// Set how gamepads join.
+    /// See [`JoinMode`].
     pub fn with_join_mode(mut self, mode: JoinMode) -> Self {
         self.join_mode = mode;
         self
     }
 
-    /// Set how players drop out.
+    /// See [`LeaveMode`].
     pub fn with_leave_mode(mut self, mode: LeaveMode) -> Self {
         self.leave_mode = mode;
         self
     }
 
-    /// Set the disconnect/reconnect behaviour.
+    /// Shorthand for [`LeaveMode::HoldButton`].
+    pub fn with_hold_to_leave(self, button: GamepadButton, secs: f32) -> Self {
+        self.with_leave_mode(LeaveMode::HoldButton {
+            button,
+            secs: secs.max(0.0),
+        })
+    }
+
+    /// See [`ReconnectPolicy`].
     pub fn with_reconnect(mut self, policy: ReconnectPolicy) -> Self {
         self.reconnect = policy;
         self
+    }
+
+    /// Radial stick deadzone, clamped to 0..0.95.
+    pub fn with_stick_deadzone(mut self, deadzone: f32) -> Self {
+        self.stick_deadzone = deadzone.clamp(0.0, 0.95);
+        self
+    }
+
+    /// Analog trigger deadzone, clamped to 0..0.95.
+    pub fn with_trigger_deadzone(mut self, deadzone: f32) -> Self {
+        self.trigger_deadzone = deadzone.clamp(0.0, 0.95);
+        self
+    }
+
+    /// Master rumble multiplier, clamped to 0..1.
+    pub fn with_rumble_scale(mut self, scale: f32) -> Self {
+        self.rumble_scale = scale.clamp(0.0, 1.0);
+        self
+    }
+
+    /// Concurrent rumble effects per player.
+    pub fn with_max_rumble_tracks(mut self, max: usize) -> Self {
+        self.max_rumble_tracks = max;
+        self
+    }
+
+    /// Start with rumble off. Players can turn it back on through this
+    /// resource.
+    pub fn without_rumble(mut self) -> Self {
+        self.rumble_enabled = false;
+        self
+    }
+
+    /// How long a leave hold must be held, or 0 when leaving isn't on a hold.
+    pub fn leave_hold_secs(&self) -> f32 {
+        match self.leave_mode {
+            LeaveMode::HoldButton { secs, .. } => secs.max(0.0),
+            LeaveMode::Manual => 0.0,
+        }
     }
 }

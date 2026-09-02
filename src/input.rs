@@ -28,8 +28,15 @@ pub const ALL_BUTTONS: [GamepadButton; 19] = [
     GamepadButton::DPadRight,
 ];
 
-/// Buttons that count for "press any button to join". Triggers are excluded:
-/// worn analog triggers rest slightly depressed and would auto-join.
+/// Buttons that count for "press any button to join".
+///
+/// Three deliberate omissions:
+///
+/// - `LeftTrigger2` / `RightTrigger2`, the analog triggers — worn ones rest
+///   slightly depressed and would auto-join a pad nobody touched. The bumpers
+///   (`LeftTrigger` / `RightTrigger`) are digital and are included.
+/// - `Select`, which is the default *leave* button.
+/// - `Mode`, the guide/home button, which platform overlays claim.
 pub const JOIN_BUTTONS: [GamepadButton; 15] = [
     GamepadButton::South,
     GamepadButton::East,
@@ -52,10 +59,14 @@ pub const JOIN_BUTTONS: [GamepadButton; 15] = [
 ///
 /// Read it off the player entity — you never touch gamepad entities yourself:
 ///
-/// ```ignore
-/// fn move_players(q: Query<(&Player, &PlayerInput, &mut Transform)>) {
-///     for (player, input, mut tf) in &q {
-///         tf.translation += input.movement().extend(0.0) * 200.0 * dt;
+/// ```
+/// use bevy::prelude::*;
+/// use bevy_couch_multiplayer::prelude::*;
+///
+/// fn move_players(time: Res<Time>, mut players: Query<(&PlayerInput, &mut Transform)>) {
+///     for (input, mut transform) in &mut players {
+///         let step = input.movement() * 250.0 * time.delta_secs();
+///         transform.translation += step.extend(0.0);
 ///     }
 /// }
 /// ```
@@ -71,7 +82,7 @@ pub struct PlayerInput {
     pub left_stick: Vec2,
     /// Right stick after radial deadzone, rescaled to 0..1.
     pub right_stick: Vec2,
-    /// D-pad as a vector, so it can stand in for the stick.
+    /// D-pad as a unit vector, so it can stand in for the stick.
     pub dpad: Vec2,
     /// Analog left trigger, deadzoned to 0..1.
     pub left_trigger: f32,
@@ -80,14 +91,19 @@ pub struct PlayerInput {
 }
 
 impl PlayerInput {
-    /// Stick if it's being used, d-pad otherwise. This is what you want for
-    /// character movement 95% of the time.
+    /// Left stick if it's being used, d-pad otherwise. This is what you want
+    /// for character movement 95% of the time.
     pub fn movement(&self) -> Vec2 {
         if self.left_stick != Vec2::ZERO {
             self.left_stick
         } else {
             self.dpad
         }
+    }
+
+    /// Right stick, for aiming or a free camera.
+    pub fn look(&self) -> Vec2 {
+        self.right_stick
     }
 
     /// Whether a button is held this frame.
@@ -105,9 +121,24 @@ impl PlayerInput {
         self.buttons.just_released(button)
     }
 
+    /// Whether any of `buttons` is held.
+    pub fn any_pressed(&self, buttons: impl IntoIterator<Item = GamepadButton>) -> bool {
+        buttons.into_iter().any(|b| self.buttons.pressed(b))
+    }
+
     /// Whether any of `buttons` went down this frame.
     pub fn any_just_pressed(&self, buttons: impl IntoIterator<Item = GamepadButton>) -> bool {
         buttons.into_iter().any(|b| self.buttons.just_pressed(b))
+    }
+
+    /// Nothing pushed and nothing held — useful for attract modes and idle
+    /// timers. Always true while disconnected.
+    pub fn is_neutral(&self) -> bool {
+        self.movement() == Vec2::ZERO
+            && self.right_stick == Vec2::ZERO
+            && self.left_trigger == 0.0
+            && self.right_trigger == 0.0
+            && self.buttons.get_pressed().next().is_none()
     }
 
     /// Wipe to neutral. Held buttons are reported as `just_released` for one
@@ -175,13 +206,17 @@ fn trigger(gamepad: &Gamepad, button: GamepadButton, deadzone: f32) -> f32 {
 ///
 /// Bevy's built-in deadzone is per-axis, which carves a square hole out of the
 /// stick: pushing diagonally can clear the deadzone on one axis but not the
-/// other, so slow diagonal movement snaps to a cardinal direction.
+/// other, so slow diagonal movement snaps to a cardinal direction. This also
+/// clamps the result to the unit circle, so a stick that reports past its
+/// corners can't hand you a 1.4x speed boost on diagonals.
 pub fn radial_deadzone(v: Vec2, deadzone: f32) -> Vec2 {
-    let len = v.length();
-    if len <= deadzone {
+    if deadzone >= 1.0 {
         return Vec2::ZERO;
     }
-    if deadzone >= 1.0 {
+    let len = v.length();
+    // The NaN guard matters: a garbage axis reading would otherwise propagate
+    // into a player's position and never come back.
+    if len.is_nan() || len <= deadzone {
         return Vec2::ZERO;
     }
     let scaled = ((len - deadzone) / (1.0 - deadzone)).clamp(0.0, 1.0);
@@ -206,6 +241,13 @@ mod tests {
     }
 
     #[test]
+    fn deadzone_keeps_the_direction_it_was_given() {
+        let v = radial_deadzone(Vec2::new(0.6, 0.8), 0.2);
+        assert!((v.normalize().x - 0.6).abs() < 1e-5);
+        assert!((v.normalize().y - 0.8).abs() < 1e-5);
+    }
+
+    #[test]
     fn live_zone_reaches_full_range() {
         let v = radial_deadzone(Vec2::new(1.0, 0.0), 0.2);
         assert!((v.length() - 1.0).abs() < 1e-5);
@@ -215,5 +257,49 @@ mod tests {
     fn diagonals_are_not_faster_than_cardinals() {
         let v = radial_deadzone(Vec2::new(1.0, 1.0), 0.1);
         assert!(v.length() <= 1.0 + 1e-5);
+    }
+
+    #[test]
+    fn a_full_deadzone_kills_everything() {
+        assert_eq!(radial_deadzone(Vec2::new(1.0, 0.0), 1.0), Vec2::ZERO);
+    }
+
+    #[test]
+    fn nonsense_input_does_not_leak_nan() {
+        assert_eq!(radial_deadzone(Vec2::new(f32::NAN, 0.0), 0.1), Vec2::ZERO);
+        assert_eq!(radial_deadzone(Vec2::ZERO, 0.0), Vec2::ZERO);
+    }
+
+    #[test]
+    fn movement_falls_back_to_the_dpad() {
+        let mut input = PlayerInput {
+            dpad: Vec2::new(1.0, 0.0),
+            ..Default::default()
+        };
+        assert_eq!(input.movement(), Vec2::new(1.0, 0.0));
+
+        input.left_stick = Vec2::new(0.0, 0.5);
+        assert_eq!(input.movement(), Vec2::new(0.0, 0.5), "stick wins when used");
+    }
+
+    #[test]
+    fn going_neutral_reports_releases_once() {
+        let mut input = PlayerInput {
+            connected: true,
+            left_stick: Vec2::new(1.0, 1.0),
+            ..Default::default()
+        };
+        input.buttons.press(GamepadButton::South);
+
+        input.go_neutral();
+
+        assert!(!input.connected);
+        assert!(!input.pressed(GamepadButton::South));
+        assert!(
+            input.just_released(GamepadButton::South),
+            "hold-to-charge logic needs the release to unwind"
+        );
+        assert_eq!(input.movement(), Vec2::ZERO);
+        assert!(input.is_neutral());
     }
 }

@@ -1,10 +1,18 @@
 use bevy_ecs::prelude::*;
 
-/// A stable, zero-based player slot. Player 0 is "P1" on screen.
+/// A stable, zero-based player slot. Slot 0 is "P1" on screen.
 ///
 /// Slots are the whole point of this crate: gamepad `Entity` ids come and go
 /// as hardware connects and disconnects, but a `PlayerId` sticks to a human
 /// for the whole session.
+///
+/// ```
+/// use bevy_couch_multiplayer::PlayerId;
+///
+/// assert_eq!(PlayerId::P2.number(), 2);   // for UI
+/// assert_eq!(PlayerId::P2.index(), 1);    // for arrays
+/// assert_eq!(PlayerId::P2.to_string(), "P2");
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PlayerId(
     /// Zero-based slot index.
@@ -12,15 +20,42 @@ pub struct PlayerId(
 );
 
 impl PlayerId {
-    /// 1-based number for UI: "Player 1", "P2 wins", etc.
-    pub fn display_number(&self) -> u8 {
-        self.0 + 1
+    /// Slot 0.
+    pub const P1: Self = Self(0);
+    /// Slot 1.
+    pub const P2: Self = Self(1);
+    /// Slot 2.
+    pub const P3: Self = Self(2);
+    /// Slot 3.
+    pub const P4: Self = Self(3);
+    /// Slot 4.
+    pub const P5: Self = Self(4);
+    /// Slot 5.
+    pub const P6: Self = Self(5);
+    /// Slot 6.
+    pub const P7: Self = Self(6);
+    /// Slot 7.
+    pub const P8: Self = Self(7);
+
+    /// A slot from its zero-based index.
+    pub const fn new(slot: u8) -> Self {
+        Self(slot)
+    }
+
+    /// Zero-based, for indexing your own per-player arrays.
+    pub const fn index(self) -> usize {
+        self.0 as usize
+    }
+
+    /// One-based, for UI: "Player 1", "P2 wins".
+    pub const fn number(self) -> u8 {
+        self.0.saturating_add(1)
     }
 
     /// A distinct per-slot colour as sRGB, so you don't have to invent one.
     /// Returned as a plain array to avoid depending on `bevy_color`; feed it
     /// straight to `Color::srgb(r, g, b)`.
-    pub fn color_rgb(&self) -> [f32; 3] {
+    pub fn color_rgb(self) -> [f32; 3] {
         const PALETTE: [[f32; 3]; 8] = [
             [0.20, 0.55, 1.00], // blue
             [1.00, 0.35, 0.30], // red
@@ -31,13 +66,19 @@ impl PlayerId {
             [1.00, 0.55, 0.20], // orange
             [0.95, 0.45, 0.75], // pink
         ];
-        PALETTE[self.0 as usize % PALETTE.len()]
+        PALETTE[self.index() % PALETTE.len()]
+    }
+}
+
+impl From<u8> for PlayerId {
+    fn from(slot: u8) -> Self {
+        Self(slot)
     }
 }
 
 impl core::fmt::Display for PlayerId {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "P{}", self.display_number())
+        write!(f, "P{}", self.number())
     }
 }
 
@@ -46,24 +87,36 @@ impl core::fmt::Display for PlayerId {
 /// This entity is spawned on join and lives until the player leaves — it
 /// deliberately survives controller disconnects, so anything you attach to it
 /// (score, character choice, inventory) survives a yanked USB cable.
+///
+/// It always carries [`PlayerDevice`](crate::PlayerDevice),
+/// [`PlayerInput`](crate::PlayerInput), [`Rumble`](crate::Rumble) and
+/// [`LeaveHold`](crate::LeaveHold).
 #[derive(Component, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Player {
     /// Which slot this entity plays in.
     pub id: PlayerId,
 }
 
+impl Player {
+    /// A player in the given slot.
+    pub const fn new(id: PlayerId) -> Self {
+        Self { id }
+    }
+}
+
 /// Which physical device is currently driving a player.
-#[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Component, Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PlayerDevice {
     /// The gamepad entity Bevy spawned for this controller.
     Gamepad(Entity),
     /// Slot is reserved but has no live hardware right now.
+    #[default]
     Missing,
 }
 
 impl PlayerDevice {
     /// The live gamepad entity, if there is one.
-    pub fn gamepad(&self) -> Option<Entity> {
+    pub const fn gamepad(&self) -> Option<Entity> {
         match self {
             Self::Gamepad(e) => Some(*e),
             Self::Missing => None,
@@ -71,7 +124,7 @@ impl PlayerDevice {
     }
 
     /// Whether hardware is currently attached.
-    pub fn is_connected(&self) -> bool {
+    pub const fn is_connected(&self) -> bool {
         matches!(self, Self::Gamepad(_))
     }
 }
@@ -88,6 +141,11 @@ pub struct DeviceFingerprint {
 }
 
 impl DeviceFingerprint {
+    /// Whether this fingerprint carries anything worth matching on.
+    pub fn is_known(&self) -> bool {
+        self.name.is_some() || self.vendor_id.is_some()
+    }
+
     /// Loose match: ids agree when both are known, otherwise fall back to name.
     ///
     /// Two identical controllers are indistinguishable by either measure, so
@@ -107,322 +165,26 @@ impl DeviceFingerprint {
     }
 }
 
-#[derive(Debug, Clone, Default)]
-pub(crate) enum SlotState {
-    #[default]
-    Empty,
-    Occupied {
-        player_entity: Entity,
-        device: PlayerDevice,
-        fingerprint: DeviceFingerprint,
-        /// Seconds (since app start) when the device dropped, if it has.
-        lost_at: Option<f64>,
-    },
-}
-
-/// The source of truth for who is playing and on what.
-#[derive(Resource, Debug)]
-pub struct PlayerRoster {
-    slots: Vec<SlotState>,
-    unassigned: Vec<Entity>,
-    join_queue: Vec<Entity>,
-    leave_queue: Vec<(PlayerId, LeaveReason)>,
-}
-
-impl PlayerRoster {
-    pub(crate) fn new(max_players: u8) -> Self {
-        Self {
-            slots: vec![SlotState::Empty; max_players.max(1) as usize],
-            unassigned: Vec::new(),
-            join_queue: Vec::new(),
-            leave_queue: Vec::new(),
-        }
-    }
-
-    /// Total slots, joined or not.
-    pub fn capacity(&self) -> usize {
-        self.slots.len()
-    }
-
-    /// How many players have joined (including ones whose pad is unplugged).
-    pub fn player_count(&self) -> usize {
-        self.slots
-            .iter()
-            .filter(|s| matches!(s, SlotState::Occupied { .. }))
-            .count()
-    }
-
-    /// Players whose controller is live right now.
-    pub fn connected_count(&self) -> usize {
-        self.slots
-            .iter()
-            .filter(|s| matches!(s, SlotState::Occupied { device, .. } if device.is_connected()))
-            .count()
-    }
-
-    /// Whether every slot is taken.
-    pub fn is_full(&self) -> bool {
-        self.player_count() >= self.capacity()
-    }
-
-    /// Gamepads that are plugged in but haven't joined.
-    pub fn unassigned_gamepads(&self) -> &[Entity] {
-        &self.unassigned
-    }
-
-    /// Whether a slot currently holds a player.
-    pub fn is_joined(&self, id: PlayerId) -> bool {
-        matches!(self.slots.get(id.0 as usize), Some(SlotState::Occupied { .. }))
-    }
-
-    /// The player entity for a slot, if that slot is occupied.
-    pub fn player_entity(&self, id: PlayerId) -> Option<Entity> {
-        match self.slots.get(id.0 as usize)? {
-            SlotState::Occupied { player_entity, .. } => Some(*player_entity),
-            SlotState::Empty => None,
-        }
-    }
-
-    /// What hardware, if any, a slot is driving.
-    pub fn device(&self, id: PlayerId) -> Option<PlayerDevice> {
-        match self.slots.get(id.0 as usize)? {
-            SlotState::Occupied { device, .. } => Some(*device),
-            SlotState::Empty => None,
-        }
-    }
-
-    /// Hardware identity of the controller in a slot — kept even while the
-    /// controller is unplugged, so "P2: reconnect your DualSense" still works.
-    pub fn fingerprint(&self, id: PlayerId) -> Option<&DeviceFingerprint> {
-        match self.slots.get(id.0 as usize)? {
-            SlotState::Occupied { fingerprint, .. } => Some(fingerprint),
-            SlotState::Empty => None,
-        }
-    }
-
-    /// Which button glyphs to show this player. See
-    /// [`GamepadBrand::button_label`](crate::GamepadBrand::button_label).
-    pub fn brand(&self, id: PlayerId) -> crate::GamepadBrand {
-        self.fingerprint(id)
-            .map(DeviceFingerprint::brand)
-            .unwrap_or_default()
-    }
-
-    /// Slot that owns a given gamepad entity.
-    pub fn player_of_gamepad(&self, gamepad: Entity) -> Option<PlayerId> {
-        self.slots.iter().enumerate().find_map(|(i, slot)| match slot {
-            SlotState::Occupied {
-                device: PlayerDevice::Gamepad(e),
-                ..
-            } if *e == gamepad => Some(PlayerId(i as u8)),
-            _ => None,
-        })
-    }
-
-    /// Every joined slot, in order.
-    pub fn players(&self) -> impl Iterator<Item = PlayerId> + '_ {
-        self.slots.iter().enumerate().filter_map(|(i, slot)| match slot {
-            SlotState::Occupied { .. } => Some(PlayerId(i as u8)),
-            SlotState::Empty => None,
-        })
-    }
-
-    /// Joined slots that currently have hardware, paired with it.
-    pub fn assigned(&self) -> impl Iterator<Item = (PlayerId, Entity)> + '_ {
-        self.slots.iter().enumerate().filter_map(|(i, slot)| match slot {
-            SlotState::Occupied {
-                device: PlayerDevice::Gamepad(e),
-                ..
-            } => Some((PlayerId(i as u8), *e)),
-            _ => None,
-        })
-    }
-
-    /// Joined players who are currently missing their controller. Show these
-    /// in a "reconnect controller" overlay.
-    pub fn disconnected_players(&self) -> impl Iterator<Item = PlayerId> + '_ {
-        self.slots.iter().enumerate().filter_map(|(i, slot)| match slot {
-            SlotState::Occupied { device, .. } if !device.is_connected() => Some(PlayerId(i as u8)),
-            _ => None,
-        })
-    }
-
-    /// Whether anyone is waiting on a controller right now.
-    pub fn any_disconnected(&self) -> bool {
-        self.disconnected_players().next().is_some()
-    }
-
-    /// Ask for a specific gamepad to join on the next update. Used by
-    /// [`JoinMode::Manual`](crate::JoinMode), e.g. from your own lobby UI.
-    pub fn request_join(&mut self, gamepad: Entity) {
-        if !self.join_queue.contains(&gamepad) {
-            self.join_queue.push(gamepad);
-        }
-    }
-
-    /// Drop a player on the next update.
-    pub fn request_leave(&mut self, id: PlayerId) {
-        if !self.leave_queue.iter().any(|(queued, _)| *queued == id) {
-            self.leave_queue.push((id, LeaveReason::Requested));
-        }
-    }
-
-    pub(crate) fn first_free_slot(&self) -> Option<PlayerId> {
-        self.slots
-            .iter()
-            .position(|s| matches!(s, SlotState::Empty))
-            .map(|i| PlayerId(i as u8))
-    }
-
-    /// The disconnected slot that has been waiting longest for hardware.
-    pub(crate) fn longest_waiting_slot(&self) -> Option<PlayerId> {
-        self.slots
-            .iter()
-            .enumerate()
-            .filter_map(|(i, slot)| match slot {
-                SlotState::Occupied {
-                    device,
-                    lost_at: Some(at),
-                    ..
-                } if !device.is_connected() => Some((i, *at)),
-                _ => None,
-            })
-            .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(core::cmp::Ordering::Equal))
-            .map(|(i, _)| PlayerId(i as u8))
-    }
-
-    /// A disconnected slot whose old controller looks like `fingerprint`.
-    pub(crate) fn waiting_slot_matching(&self, fingerprint: &DeviceFingerprint) -> Option<PlayerId> {
-        self.slots.iter().enumerate().find_map(|(i, slot)| match slot {
-            SlotState::Occupied {
-                device,
-                fingerprint: known,
-                ..
-            } if !device.is_connected() && known.matches(fingerprint) => Some(PlayerId(i as u8)),
-            _ => None,
-        })
-    }
-
-    /// Slots whose reconnect grace period has run out.
-    pub(crate) fn expired_slots(&self, grace_secs: f32, now: f64) -> Vec<PlayerId> {
-        self.slots
-            .iter()
-            .enumerate()
-            .filter_map(|(i, slot)| match slot {
-                SlotState::Occupied {
-                    lost_at: Some(at), ..
-                } if now - *at >= grace_secs as f64 => Some(PlayerId(i as u8)),
-                _ => None,
-            })
-            .collect()
-    }
-
-    pub(crate) fn occupy(
-        &mut self,
-        id: PlayerId,
-        player_entity: Entity,
-        gamepad: Entity,
-        fingerprint: DeviceFingerprint,
-    ) {
-        if let Some(slot) = self.slots.get_mut(id.0 as usize) {
-            *slot = SlotState::Occupied {
-                player_entity,
-                device: PlayerDevice::Gamepad(gamepad),
-                fingerprint,
-                lost_at: None,
-            };
-        }
-    }
-
-    /// Hand hardware to an occupied slot. Returns its player entity.
-    pub(crate) fn attach_device(
-        &mut self,
-        id: PlayerId,
-        gamepad: Entity,
-        fingerprint: DeviceFingerprint,
-    ) -> Option<Entity> {
-        match self.slots.get_mut(id.0 as usize)? {
-            SlotState::Occupied {
-                player_entity,
-                device,
-                fingerprint: known,
-                lost_at,
-            } => {
-                *device = PlayerDevice::Gamepad(gamepad);
-                *known = fingerprint;
-                *lost_at = None;
-                Some(*player_entity)
-            }
-            SlotState::Empty => None,
-        }
-    }
-
-    /// Returns the player entity, or `None` if the slot was already flagged.
-    pub(crate) fn mark_disconnected(&mut self, id: PlayerId, now: f64) -> Option<Entity> {
-        match self.slots.get_mut(id.0 as usize)? {
-            SlotState::Occupied {
-                player_entity,
-                device,
-                lost_at,
-                ..
-            } if device.is_connected() => {
-                *device = PlayerDevice::Missing;
-                *lost_at = Some(now);
-                Some(*player_entity)
-            }
-            _ => None,
-        }
-    }
-
-    /// Empty a slot, returning what was in it.
-    pub(crate) fn vacate(&mut self, id: PlayerId) -> Option<(Entity, PlayerDevice)> {
-        let slot = self.slots.get_mut(id.0 as usize)?;
-        match core::mem::replace(slot, SlotState::Empty) {
-            SlotState::Occupied {
-                player_entity,
-                device,
-                ..
-            } => Some((player_entity, device)),
-            SlotState::Empty => None,
-        }
-    }
-
-    pub(crate) fn set_unassigned(&mut self, gamepads: Vec<Entity>) {
-        self.unassigned = gamepads;
-    }
-
-    pub(crate) fn claim_unassigned(&mut self, gamepad: Entity) {
-        self.unassigned.retain(|e| *e != gamepad);
-    }
-
-    pub(crate) fn release_unassigned(&mut self, gamepad: Entity) {
-        if !self.unassigned.contains(&gamepad) {
-            self.unassigned.push(gamepad);
-        }
-    }
-
-    pub(crate) fn take_join_requests(&mut self) -> Vec<Entity> {
-        core::mem::take(&mut self.join_queue)
-    }
-
-    pub(crate) fn take_leave_requests(&mut self) -> Vec<(PlayerId, LeaveReason)> {
-        core::mem::take(&mut self.leave_queue)
-    }
-
-    pub(crate) fn queue_leave(&mut self, id: PlayerId, reason: LeaveReason) {
-        if !self.leave_queue.iter().any(|(queued, _)| *queued == id) {
-            self.leave_queue.push((id, reason));
-        }
-    }
-}
-
-impl Default for PlayerRoster {
-    fn default() -> Self {
-        Self::new(4)
-    }
-}
-
 /// A new player took a slot.
+///
+/// Read this in [`PreUpdate`](bevy_app::PreUpdate) after
+/// [`CouchSystems::Membership`](crate::CouchSystems) to attach your gameplay
+/// components before anything in `Update` sees the new player:
+///
+/// ```
+/// use bevy::prelude::*;
+/// use bevy_couch_multiplayer::prelude::*;
+/// # #[derive(Component)] struct Score(u32);
+///
+/// fn dress_new_players(mut joined: MessageReader<PlayerJoined>, mut commands: Commands) {
+///     for event in joined.read() {
+///         commands.entity(event.player_entity).insert(Score(0));
+///     }
+/// }
+///
+/// # let mut app = App::new();
+/// app.add_systems(PreUpdate, dress_new_players.after(CouchSystems::Membership));
+/// ```
 #[derive(Message, Debug, Clone, Copy)]
 pub struct PlayerJoined {
     /// The slot they took.
@@ -448,7 +210,8 @@ pub struct PlayerLeft {
 /// Why a player left.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LeaveReason {
-    /// Held the leave button.
+    /// Held the leave button, or you called
+    /// [`PlayerRoster::request_leave`](crate::PlayerRoster::request_leave).
     Requested,
     /// Their controller stayed gone past the reconnect grace period.
     TimedOut,
@@ -481,20 +244,55 @@ pub struct PlayerReconnected {
     pub same_device: bool,
 }
 
-/// Run condition: true while any joined player is missing their controller.
-///
-/// ```
-/// use bevy::prelude::*;
-/// use bevy_couch_multiplayer::prelude::*;
-/// # fn gameplay() {}
-/// # let mut app = App::new();
-/// app.add_systems(Update, gameplay.run_if(not(any_player_disconnected)));
-/// ```
-pub fn any_player_disconnected(roster: Res<PlayerRoster>) -> bool {
-    roster.any_disconnected()
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-/// Run condition: true once at least one player has joined.
-pub fn any_player_joined(roster: Res<PlayerRoster>) -> bool {
-    roster.player_count() > 0
+    fn pad(name: &str, vendor: u16, product: u16) -> DeviceFingerprint {
+        DeviceFingerprint {
+            name: Some(name.to_string()),
+            vendor_id: Some(vendor),
+            product_id: Some(product),
+        }
+    }
+
+    #[test]
+    fn ids_read_naturally() {
+        assert_eq!(PlayerId::P1.number(), 1);
+        assert_eq!(PlayerId::P4.index(), 3);
+        assert_eq!(PlayerId::from(2), PlayerId::P3);
+    }
+
+    #[test]
+    fn ids_are_ordered_by_slot() {
+        let mut ids = vec![PlayerId::P3, PlayerId::P1, PlayerId::P2];
+        ids.sort();
+        assert_eq!(ids, vec![PlayerId::P1, PlayerId::P2, PlayerId::P3]);
+    }
+
+    #[test]
+    fn same_hardware_matches() {
+        assert!(pad("DualSense", 0x054C, 0x0CE6).matches(&pad("DualSense", 0x054C, 0x0CE6)));
+    }
+
+    #[test]
+    fn different_product_does_not_match() {
+        assert!(!pad("Pad", 0x054C, 0x0CE6).matches(&pad("Pad", 0x054C, 0x09CC)));
+    }
+
+    #[test]
+    fn falls_back_to_name_without_ids() {
+        let named = DeviceFingerprint {
+            name: Some("Wireless Controller".into()),
+            ..Default::default()
+        };
+        assert!(named.matches(&named.clone()));
+        assert!(!named.matches(&DeviceFingerprint::default()));
+    }
+
+    #[test]
+    fn anonymous_devices_never_match() {
+        // Otherwise every unidentifiable pad would claim the first held slot.
+        assert!(!DeviceFingerprint::default().matches(&DeviceFingerprint::default()));
+    }
 }

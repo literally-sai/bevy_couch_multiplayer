@@ -40,6 +40,58 @@
 //! [`PlayerInput`] is deadzoned and attributed to the right slot before your
 //! `Update` systems run.
 //!
+//! # Three ways to reach a player
+//!
+//! Pick whichever fits the system you're writing:
+//!
+//! ```
+//! use bevy::prelude::*;
+//! use bevy_couch_multiplayer::prelude::*;
+//!
+//! // 1. A query, when you want gameplay components alongside the input.
+//! fn shoot(players: Query<(&PlayerInput, &Transform)>) {}
+//!
+//! // 2. `Players`, when you think in slots.
+//! fn menu(players: Players) {
+//!     if players.any_just_pressed(GamepadButton::Start) {}
+//!     let _ = players.get(PlayerId::P2);
+//! }
+//!
+//! // 3. `PlayerRoster`, for lobby UI: who's in, on what, is anyone unplugged.
+//! fn hud(roster: Res<PlayerRoster>) {
+//!     for slot in roster.iter() {
+//!         let _ = (slot.id(), slot.is_connected(), slot.brand().name());
+//!     }
+//! }
+//! ```
+//!
+//! # Joining and leaving
+//!
+//! [`PlayerJoined`] arrives in [`PreUpdate`], so a system ordered
+//! `.after(CouchSystems::Membership)` can dress the new player before anything
+//! in `Update` sees it:
+//!
+//! ```
+//! use bevy::prelude::*;
+//! use bevy_couch_multiplayer::prelude::*;
+//! # #[derive(Component)] struct Score(u32);
+//! # #[derive(Component)] struct TeamColor([f32; 3]);
+//!
+//! fn on_join(mut joined: MessageReader<PlayerJoined>, mut commands: Commands) {
+//!     for event in joined.read() {
+//!         commands
+//!             .entity(event.player_entity)
+//!             .insert((Score(0), TeamColor(event.id.color_rgb())));
+//!     }
+//! }
+//!
+//! # let mut app = App::new();
+//! app.add_systems(PreUpdate, on_join.after(CouchSystems::Membership));
+//! ```
+//!
+//! Anything you attach survives a disconnect and is despawned with the player
+//! when they leave.
+//!
 //! # Rumble
 //!
 //! Request haptics for a *player*, never for a gamepad:
@@ -48,16 +100,15 @@
 //! use bevy::prelude::*;
 //! use bevy_couch_multiplayer::prelude::*;
 //!
-//! fn on_explosion(mut players: Query<&mut Rumble>) {
-//!     for mut rumble in &mut players {
-//!         rumble.play(RumblePattern::explosion(0.9));
-//!     }
+//! fn on_explosion(mut haptics: Haptics) {
+//!     haptics.play_all(RumblePattern::explosion(0.9));
 //! }
 //! ```
 //!
 //! Patterns are envelopes, not flat buzzes, and the driver keeps exactly one
-//! live effect per gamepad however many you stack. See [`Rumble`] for the
-//! mixing rules.
+//! live effect per gamepad however many you stack. [`Rumble::play`] hands back
+//! a [`RumbleHandle`] so a looping effect can be stopped again without
+//! silencing everything else. See [`Rumble`] for the mixing rules.
 //!
 //! # Scheduling
 //!
@@ -73,31 +124,37 @@ mod config;
 mod haptics;
 mod input;
 mod join;
+mod params;
 mod player;
+mod roster;
 
 pub use brand::{GamepadBrand, vendor};
 pub use config::{CouchConfig, JoinMode, JoinTrigger, LeaveMode, ReconnectPolicy};
-pub use haptics::{Rumble, RumbleKey, RumblePattern};
+pub use haptics::{Rumble, RumbleHandle, RumbleKey, RumblePattern};
 pub use input::{ALL_BUTTONS, JOIN_BUTTONS, PlayerInput, radial_deadzone};
 pub use join::LeaveHold;
+pub use params::{Haptics, Players};
 pub use player::{
     DeviceFingerprint, LeaveReason, Player, PlayerDevice, PlayerDisconnected, PlayerId,
-    PlayerJoined, PlayerLeft, PlayerReconnected, PlayerRoster, any_player_disconnected,
-    any_player_joined,
+    PlayerJoined, PlayerLeft, PlayerReconnected,
+};
+pub use roster::{
+    PlayerRoster, PlayerSlot, any_player_disconnected, any_player_joined, lobby_is_full,
 };
 
 use bevy_app::prelude::*;
 use bevy_ecs::prelude::*;
 use bevy_input::InputSystems;
+use bevy_input::prelude::GamepadButton;
 
 /// Everything you normally need.
 pub mod prelude {
     pub use crate::{
         CouchConfig, CouchMultiplayerPlugin, CouchSystems, DeviceFingerprint, GamepadBrand,
-        JoinMode, JoinTrigger, LeaveHold, LeaveMode, LeaveReason, Player, PlayerDevice,
+        Haptics, JoinMode, JoinTrigger, LeaveHold, LeaveMode, LeaveReason, Player, PlayerDevice,
         PlayerDisconnected, PlayerId, PlayerInput, PlayerJoined, PlayerLeft, PlayerReconnected,
-        PlayerRoster, ReconnectPolicy, Rumble, RumbleKey, RumblePattern, any_player_disconnected,
-        any_player_joined,
+        PlayerRoster, PlayerSlot, Players, ReconnectPolicy, Rumble, RumbleHandle, RumbleKey,
+        RumblePattern, any_player_disconnected, any_player_joined, lobby_is_full,
     };
 }
 
@@ -127,16 +184,25 @@ pub enum CouchSystems {
 /// // Four players, join by pressing any button, hold Select for 2s to drop out.
 /// let plugin = CouchMultiplayerPlugin::new(4)
 ///     .with_join_mode(JoinMode::PressToJoin(JoinTrigger::AnyButton))
-///     .with_leave_mode(LeaveMode::HoldButton {
-///         button: GamepadButton::Select,
-///         secs: 2.0,
-///     });
+///     .with_hold_to_leave(GamepadButton::Select, 2.0);
 /// ```
 #[derive(Debug, Clone, Default)]
 pub struct CouchMultiplayerPlugin {
     /// Starting configuration. Also inserted as a mutable [`CouchConfig`]
     /// resource, so an options menu can change it at runtime.
     pub config: CouchConfig,
+}
+
+/// Forwards a [`CouchConfig`] builder method onto the plugin, so both spell
+/// setup the same way.
+macro_rules! forward_config {
+    ($(#[$meta:meta])* $name:ident ( $( $arg:ident : $ty:ty ),* )) => {
+        $(#[$meta])*
+        pub fn $name(mut self, $($arg: $ty),*) -> Self {
+            self.config = self.config.$name($($arg),*);
+            self
+        }
+    };
 }
 
 impl CouchMultiplayerPlugin {
@@ -153,35 +219,52 @@ impl CouchMultiplayerPlugin {
         Self { config }
     }
 
-    /// See [`JoinMode`].
-    pub fn with_join_mode(mut self, mode: JoinMode) -> Self {
-        self.config.join_mode = mode;
-        self
-    }
+    forward_config!(
+        /// Slot count, clamped to at least 1.
+        with_max_players(max: u8)
+    );
+    forward_config!(
+        /// See [`JoinMode`].
+        with_join_mode(mode: JoinMode)
+    );
+    forward_config!(
+        /// See [`LeaveMode`].
+        with_leave_mode(mode: LeaveMode)
+    );
+    forward_config!(
+        /// Shorthand for [`LeaveMode::HoldButton`].
+        with_hold_to_leave(button: GamepadButton, secs: f32)
+    );
+    forward_config!(
+        /// See [`ReconnectPolicy`].
+        with_reconnect(policy: ReconnectPolicy)
+    );
+    forward_config!(
+        /// Radial stick deadzone, applied on top of Bevy's per-axis one.
+        with_stick_deadzone(deadzone: f32)
+    );
+    forward_config!(
+        /// Below this, a trigger reads as 0.0.
+        with_trigger_deadzone(deadzone: f32)
+    );
+    forward_config!(
+        /// Master rumble multiplier, clamped to 0..1.
+        with_rumble_scale(scale: f32)
+    );
+    forward_config!(
+        /// Concurrent rumble effects kept per player.
+        with_max_rumble_tracks(max: usize)
+    );
+    forward_config!(
+        /// Start with rumble off. Players can turn it back on through the
+        /// [`CouchConfig`] resource.
+        without_rumble()
+    );
+}
 
-    /// See [`LeaveMode`].
-    pub fn with_leave_mode(mut self, mode: LeaveMode) -> Self {
-        self.config.leave_mode = mode;
-        self
-    }
-
-    /// See [`ReconnectPolicy`].
-    pub fn with_reconnect(mut self, policy: ReconnectPolicy) -> Self {
-        self.config.reconnect = policy;
-        self
-    }
-
-    /// Radial stick deadzone, applied on top of Bevy's per-axis one.
-    pub fn with_stick_deadzone(mut self, deadzone: f32) -> Self {
-        self.config.stick_deadzone = deadzone.clamp(0.0, 0.95);
-        self
-    }
-
-    /// Start with rumble off. Players can turn it back on through the
-    /// [`CouchConfig`] resource.
-    pub fn without_rumble(mut self) -> Self {
-        self.config.rumble_enabled = false;
-        self
+impl From<CouchConfig> for CouchMultiplayerPlugin {
+    fn from(config: CouchConfig) -> Self {
+        Self::from_config(config)
     }
 }
 
@@ -207,6 +290,11 @@ impl Plugin for CouchMultiplayerPlugin {
             .add_message::<PlayerLeft>()
             .add_message::<PlayerDisconnected>()
             .add_message::<PlayerReconnected>()
+            // Normally `GamepadPlugin` registers this. Doing it here too (the
+            // call is idempotent) keeps our systems runnable on a headless app
+            // with no gamepad backend, where a missing message queue would
+            // otherwise skip them entirely.
+            .add_message::<bevy_input::gamepad::GamepadRumbleRequest>()
             // Bevy spawns and updates gamepad entities inside `InputSystems`,
             // so everything here has to come after it. Sync points between
             // these sets are inserted for us, which is what lets `Input` see

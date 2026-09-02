@@ -53,6 +53,11 @@ impl GamepadBrand {
             Some(vendor::MICROSOFT) => return Self::Xbox,
             Some(vendor::NINTENDO) => return Self::Nintendo,
             Some(vendor::VALVE) => return Self::Steam,
+            // 8BitDo pads deliberately impersonate other families depending on
+            // which mode the switch on the back is in, so the vendor id says
+            // nothing about the glyphs printed on the buttons. Fall through to
+            // the name, which usually does ("8BitDo Pro 2 (Switch)").
+            Some(vendor::EIGHT_BITDO) => {}
             _ => {}
         }
 
@@ -70,7 +75,7 @@ impl GamepadBrand {
             "ps5",
         ];
         const XBOX: [&str; 3] = ["xbox", "xinput", "x-box"];
-        const NINTENDO: [&str; 4] = ["nintendo", "switch", "joy-con", "joycon"];
+        const NINTENDO: [&str; 5] = ["nintendo", "switch", "joy-con", "joycon", "pro controller"];
         const STEAM: [&str; 2] = ["steam", "valve"];
 
         if PLAYSTATION.iter().any(|k| lower.contains(k)) {
@@ -199,6 +204,20 @@ mod tests {
         assert_eq!(GamepadBrand::Nintendo.button_label(GamepadButton::South), "B");
         assert_eq!(GamepadBrand::Xbox.button_label(GamepadButton::South), "A");
         assert_eq!(GamepadBrand::PlayStation.button_label(GamepadButton::South), "✕");
+    }
+
+    #[test]
+    fn mode_switching_pads_are_read_from_their_name() {
+        // The vendor id is 8BitDo's in every mode, so only the name can say
+        // which glyphs are printed on the buttons.
+        assert_eq!(
+            GamepadBrand::detect(Some("8BitDo Pro 2 (Switch)"), Some(vendor::EIGHT_BITDO)),
+            GamepadBrand::Nintendo
+        );
+        assert_eq!(
+            GamepadBrand::detect(Some("8BitDo Ultimate (XInput)"), Some(vendor::EIGHT_BITDO)),
+            GamepadBrand::Xbox
+        );
     }
 
     #[test]
